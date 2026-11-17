@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -64,8 +65,8 @@ def measure_status_bar_cpu():
         )
 
     app = NSApplication.sharedApplication()
-    if app is None or NSWorkspace.sharedWorkspace().accessibilityDisplayShouldReduceMotion():
-        print("CPU check requires an AppKit session with Reduce Motion off", file=sys.stderr)
+    if app is None:
+        print("CPU check requires an AppKit session", file=sys.stderr)
         return 77
     app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
     app.finishLaunching()
@@ -82,13 +83,19 @@ def measure_status_bar_cpu():
     # Keep the run loop alive in the idle case without introducing periodic work.
     keepalive = NSTimer.scheduledTimerWithTimeInterval_repeats_block_(60, False, lambda _: None)
     samples = {}
+    # Benchmark animated rendering regardless of the runner's accessibility
+    # preference. Override only this module's preference lookup in this child
+    # process; retain the real workspace, status item, layers, and run loop.
+    workspace = Mock(wraps=NSWorkspace.sharedWorkspace())
+    workspace.accessibilityDisplayShouldReduceMotion.return_value = False
     try:
         for name, state in (
             ("idle", status_bar.STATE_IDLE),
             ("working", status_bar.STATE_WORKING),
             ("waiting for input", status_bar.STATE_ASK),
         ):
-            with redirect_stdout(sys.stderr):
+            with redirect_stdout(sys.stderr), patch.object(status_bar, "NSWorkspace") as workspace_class:
+                workspace_class.sharedWorkspace.return_value = workspace
                 controller.set_status(state)
             # Exclude the initial transition and measure sustained animation.
             run_loop.runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(2.0))
