@@ -19,9 +19,11 @@ from .models import (
     parse_datetime,
     provider_label,
 )
+from .junie_index import junie_session_info, junie_session_project_dir
 from .origin import origin_label_from_payload
 from .providers import detect_log_path, parse_log_line
 from .settings import AgentMonitorSettings, load_settings
+from .text_utils import read_recent_lines, truncate_text
 
 
 CODEX_TRANSCRIPT_PROVIDER = "codex-transcripts"
@@ -125,6 +127,7 @@ class AgentMonitor:
         self._transcript_file_list_cache: dict[tuple[str, int], CachedTranscriptFileList] = {}
         self._latest_status_signature: tuple[Any, ...] | None = None
         self._latest_statuses_by_key: dict[str, AgentStatus] | None = None
+        self._suppressed_codex_sessions: set[str] = set()
 
     @classmethod
     def from_default_sources(
@@ -201,8 +204,15 @@ class AgentMonitor:
             self._iter_records(),
             key=lambda record: record.logged_at,
         )
+        self._suppressed_codex_sessions = {
+            record.session_id
+            for record in records
+            if record.session_id and is_codex_composer_prediction(record)
+        }
 
         for record in records:
+            if record.provider == "codex" and record.session_id in self._suppressed_codex_sessions:
+                continue
             metadata = metadata_for_record(
                 record,
                 metadata_by_session,
@@ -403,11 +413,20 @@ class LiveAgentMonitor:
         self.metadata_by_session: dict[str, StatusMetadata] = {}
         self.metadata_by_status: dict[str, StatusMetadata] = {}
         self.pending_permissions_by_key: dict[str, set[str]] = {}
+        self._suppressed_codex_sessions: set[str] = set()
         self.load_latest_state()
         self.reconcile_recovery_sources()
 
     def ingest_record(self, record: HookEvent) -> None:
         with self.lock:
+            if record.provider == "codex" and record.session_id:
+                if record.session_id in self._suppressed_codex_sessions:
+                    return
+                if is_codex_composer_prediction(record):
+                    self._suppressed_codex_sessions.add(record.session_id)
+                    if self._discard_suppressed_statuses():
+                        self.write_latest_state()
+                    return
             metadata = metadata_for_record(
                 record,
                 self.metadata_by_session,
@@ -509,7 +528,8 @@ class LiveAgentMonitor:
             post_tool_working_visible_seconds=self.post_tool_working_visible_seconds,
         )
         recovered_statuses = recovery_monitor._latest_statuses()
-        changed = False
+        self._suppressed_codex_sessions.update(recovery_monitor._suppressed_codex_sessions)
+        changed = self._discard_suppressed_statuses()
         for agent_id, recovered in recovered_statuses.items():
             previous = self.statuses_by_key.get(agent_id)
             if previous is not None and recovered.updated_at < previous.updated_at:
@@ -520,6 +540,17 @@ class LiveAgentMonitor:
 
         if changed:
             self.write_latest_state()
+
+    def _discard_suppressed_statuses(self) -> bool:
+        suppressed_keys = [
+            key
+            for key, status in self.statuses_by_key.items()
+            if status.provider == "codex" and status.session_id in self._suppressed_codex_sessions
+        ]
+        for key in suppressed_keys:
+            self.statuses_by_key.pop(key)
+            self.pending_permissions_by_key.pop(key, None)
+        return bool(suppressed_keys)
 
     def write_latest_state(self) -> None:
         if self.latest_state_path is None:
@@ -1042,22 +1073,36 @@ def metadata_for_record(
 
 
 def update_metadata(metadata: StatusMetadata, record: HookEvent) -> None:
-    if record.cwd:
-        metadata.cwd = record.cwd
+    cwd = project_dir_from_event(record)
+    if cwd:
+        metadata.cwd = cwd
 
-    title = title_from_event(record)
-    if title and (metadata.title is None or is_provider_session_title(record, title)):
-        metadata.title = title
+    title = provider_session_title(record)
+    if title or metadata.title is None:
+        metadata.title = title or prompt_title_from_event(record)
 
     origin = record.origin or origin_label_from_payload(record.provider, record.raw)
     if origin:
         metadata.origin = origin
 
 
-def is_provider_session_title(record: HookEvent, title: str) -> bool:
+def project_dir_from_event(record: HookEvent) -> str | None:
+    if record.provider == "junie":
+        return (
+            _string_or_none(record.raw.get("project_path"))
+            or junie_session_project_dir(record.session_id)
+            or record.cwd
+        )
+    return record.cwd
+
+
+def provider_session_title(record: HookEvent) -> str | None:
     if record.provider == "codex":
-        return title == codex_session_title(record.session_id)
-    return False
+        return codex_session_title(record.session_id)
+    if record.provider == "junie":
+        session = junie_session_info(record.session_id)
+        return session.title if session else None
+    return None
 
 
 def status_from_event(
@@ -1083,7 +1128,7 @@ def status_from_event(
         # timestamp so recovery can also correct a previously persisted Ask.
         mode = AgentMode.IDLE_READY
 
-    metadata = metadata or StatusMetadata(cwd=record.cwd)
+    metadata = metadata or StatusMetadata(cwd=project_dir_from_event(record))
     if should_ignore_record(record, metadata):
         return None
 
@@ -1106,7 +1151,7 @@ def status_from_event(
         updated_at=record.logged_at,
         event_name=record.event_name,
         session_id=record.session_id,
-        cwd=record.cwd,
+        cwd=metadata.cwd or record.cwd,
         tool_name=record.tool_name,
         message=record.message,
         origin=record.origin or metadata.origin or origin_label_from_payload(record.provider, record.raw),
@@ -1151,7 +1196,9 @@ def mode_for_event(record: HookEvent) -> AgentMode | None:
             return AgentMode.WAITING_FOR_INPUT
         return AgentMode.WORKING
     if event in {"PreToolUse"}:
-        if codex_question_tool(record):
+        if codex_question_tool(record) or (
+            record.provider == "junie" and record.tool_name == "AskUserQuestion"
+        ):
             return AgentMode.WAITING_FOR_INPUT
         return AgentMode.TOOL_RUNNING
     if event in {"PostToolUse"}:
@@ -1422,6 +1469,17 @@ def agent_status_from_dict(data: object) -> AgentStatus | None:
                     session_id[:8],
                     display_name,
                 )
+        elif provider == "junie" and session_id:
+            session = junie_session_info(session_id)
+            if session:
+                cwd = session.project_dir or cwd
+            if session and session.title:
+                display_name = display_name_from_parts(
+                    project_name(cwd),
+                    session.title,
+                    session_id[:8],
+                    display_name,
+                )
 
         mode = AgentMode(str(data["mode"]))
         updated_at = parse_datetime(data["updated_at"])
@@ -1516,9 +1574,25 @@ def should_ignore_status_transition(
     )
 
 
+def is_codex_composer_prediction(record: HookEvent) -> bool:
+    prompt = record.raw.get("prompt")
+    return (
+        record.provider == "codex"
+        and record.event_name == "UserPromptSubmit"
+        and record.raw.get("transcript_path") is None
+        and isinstance(prompt, str)
+        and prompt.partition("\n")[0] == (
+            "This is an app-generated request for a suggested next user message. "
+            "The user did not write this message."
+        )
+    )
+
+
 def should_ignore_record(record: HookEvent, metadata: StatusMetadata) -> bool:
     if record.provider != "codex":
         return False
+    if is_codex_composer_prediction(record):
+        return True
 
     raw = record.raw
     text = " ".join(
@@ -1539,30 +1613,6 @@ def should_ignore_record(record: HookEvent, metadata: StatusMetadata) -> bool:
         "you are an expert at upholding safety and compliance standards",
     )
     return any(prompt in text for prompt in internal_prompts)
-
-
-def read_recent_lines(path: Path, max_lines: int) -> list[str]:
-    if max_lines <= 0:
-        return []
-
-    chunk_size = 8192
-    chunks: list[bytes] = []
-    newline_count = 0
-
-    with path.open("rb") as handle:
-        handle.seek(0, 2)
-        position = handle.tell()
-        while position > 0 and newline_count <= max_lines:
-            read_size = min(chunk_size, position)
-            position -= read_size
-            handle.seek(position)
-            chunk = handle.read(read_size)
-            chunks.append(chunk)
-            newline_count += chunk.count(b"\n")
-
-    data = b"".join(reversed(chunks))
-    lines = data.decode("utf-8", errors="replace").splitlines()
-    return lines[-max_lines:]
 
 
 def _replace_stale(status: AgentStatus, stale: bool) -> AgentStatus:
@@ -1604,11 +1654,10 @@ def _replace_mode(status: AgentStatus, mode: AgentMode) -> AgentStatus:
 
 
 def title_from_event(record: HookEvent) -> str | None:
-    if record.provider == "codex":
-        title = codex_session_title(record.session_id)
-        if title:
-            return title
+    return provider_session_title(record) or prompt_title_from_event(record)
 
+
+def prompt_title_from_event(record: HookEvent) -> str | None:
     if record.event_name != "UserPromptSubmit":
         return None
     return summarize_prompt(record.raw.get("prompt"))
@@ -1744,16 +1793,6 @@ def project_name(cwd: str | None) -> str | None:
             # Their display metadata must not prevent status accounting.
             continue
     return path.name or cwd
-
-
-def truncate_text(text: str, max_len: int) -> str:
-    if len(text) <= max_len:
-        return text
-    trimmed = text[: max_len - 1].rstrip()
-    boundary = max(trimmed.rfind(" "), trimmed.rfind(","), trimmed.rfind(";"))
-    if boundary >= max_len // 2:
-        trimmed = trimmed[:boundary].rstrip()
-    return f"{trimmed}..."
 
 
 def _tool_response_looks_failed(response: object) -> bool:

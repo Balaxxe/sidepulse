@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from .audit import append_status_audit_record
-from .collector import StatusMetadata, read_recent_lines, status_from_event, title_from_event
+from .collector import StatusMetadata, project_dir_from_event, status_from_event, title_from_event
+from .text_utils import read_recent_lines
 from .origin import annotate_payload_with_origin
 from .providers import detect_log_path, infer_provider_from_payload, parse_log_line
 
@@ -90,7 +91,7 @@ def write_hook_status_audit(provider: str, line: dict[str, Any]) -> None:
         )
         if record is None:
             return
-        metadata = StatusMetadata(cwd=record.cwd, title=title_from_event(record))
+        metadata = StatusMetadata(cwd=project_dir_from_event(record), title=title_from_event(record))
         append_status_audit_record(record, status_from_event(record, metadata))
     except Exception:
         pass
@@ -145,20 +146,12 @@ def junie_process_id() -> int | None:
 
 def junie_process_context() -> tuple[int | None, dict[str, str] | None]:
     try:
-        from .origin import origin_from_processes, process_ancestry, process_basename
+        from .origin import is_junie_process, origin_from_processes, process_ancestry
 
         ancestry = process_ancestry(os.getppid())
         origin = origin_from_processes("junie", ancestry)
         for info in ancestry:
-            command = info.command.lower()
-            if process_basename(info) == "junie" or any(
-                marker in command
-                for marker in (
-                    "/junie.app/",
-                    "junie-release-",
-                    "matterhorn.ej.app.cli.standalone",
-                )
-            ):
+            if is_junie_process(info):
                 return info.pid, origin.to_payload() if origin is not None else None
     except Exception:
         pass

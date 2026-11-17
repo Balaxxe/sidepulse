@@ -37,10 +37,39 @@ downloads Python 3.13 using uv into `~/.local/share/sidepulse`, without requirin
 Homebrew or administrator access. On Linux, install Python 3.10 or newer first. The
 [setup script](scripts/setup.sh) creates an isolated environment under
 `~/.local/share/sidepulse/venv`, installs SidePulse from GitHub, links the CLI
-at `~/.local/bin/sidepulse`, and runs `sidepulse setup`. On macOS, setup also
-installs the menu-bar app and hardware helpers. On Linux, it automatically
-uses CLI-only mode for mounted SidePulse devices and iPhone/Android linking and push. Run
-`sidepulse update` to upgrade to the newest version from GitHub.
+at `~/.local/bin/sidepulse`, and runs `sidepulse setup`.
+
+All available components are checked by default, and **Install** is focused.
+Use the up and down arrow keys to move, Space to toggle a checkbox, and Enter
+on **Install** to start setup. Press `q` to cancel.
+The Agent hooks group lists Codex, Claude Code, Grok, Cursor, and Junie on
+macOS and Linux. The macOS integrations group lists SD card ejection prevention
+(important for deep sleep) and the status-bar indicator. Leaving an item
+unchecked skips its setup for this run. The core CLI and background service are
+included in every install.
+
+The one-command installer sets up SD card ejection prevention as a system-wide
+LaunchDaemon so it can run before login. Selecting it requests administrator
+approval during interactive setup. Setup removes the old per-user guard after
+the system guard starts.
+
+Setup shows progress as it checks requirements, prepares Python, builds and
+installs packages, and configures services and selected components.
+It keeps detailed output in
+`${XDG_STATE_HOME:-$HOME/.local/state}/sidepulse/setup/`. On failure, it shows
+the last 30 lines and the full log path.
+
+Agents and automation can install all available components without prompting.
+This command also reports a failed download to the caller.
+
+```sh
+bash -o pipefail -c 'curl -fsSL https://sidepulse.io/setup.sh | env SIDEPULSE_SETUP_NONINTERACTIVE=1 sh'
+```
+
+From a checkout, run `sh scripts/setup.sh --headless`. For an existing install,
+run `sidepulse update --headless`. Headless macOS setup needs non-interactive
+`sudo` to install the system eject guard. To skip the guard from a checkout,
+use `sh scripts/setup.sh --headless --no-sd-eject-guard`.
 
 `sp` is a short alias for `sidepulse`; for example, `sp status` runs
 `sidepulse status`.
@@ -50,7 +79,7 @@ named **SidePulse Background Service** in macOS background activity settings,
 and a user systemd service on Linux. Setup restarts the service, so an
 upgrade takes effect right away instead of leaving the previous build running.
 If a Linux session has no systemd user manager, setup still installs the unit
-and prints that it could not start; `sidepulse service run` remains available as
+and records in the setup log that it could not start. `sidepulse service run` is
 a foreground fallback.
 
 For fresh Linux installation, official-main upgrade, service recovery, and
@@ -181,6 +210,7 @@ reported in the tooltip. Checking does not install updates or change the current
 
 ```sh
 sidepulse update
+sidepulse update --headless
 sidepulse update --dry-run
 ```
 
@@ -190,7 +220,7 @@ run a partial installer. The website script forwards to `scripts/setup.sh` on
 GitHub, keeping both entry points on one implementation.
 
 The installer updates `~/.local/share/sidepulse/venv` from GitHub, refreshes the
-CLI links, and runs `sidepulse setup` to configure hooks and restart services.
+CLI links, and runs `sidepulse setup` for the selected components.
 It replaces the installed code even when the package version has not changed.
 Settings and linked devices are retained. Downloads and builds finish before
 the background service and menu-bar app are paused; if installation fails,
@@ -621,13 +651,15 @@ Junie CLI, installs SidePulse Pro Eject Prevention, writes the status-bar
 LaunchAgent, starts both helpers immediately, and enables them at login. This is
 intentionally an explicit command instead of a `pip install` side effect. To set
 up only one provider, pass its name, for example `sidepulse setup junie`.
-To skip the status-bar app but still install hooks and SidePulse Pro Eject Prevention, use
-`sidepulse setup --no-status-bar`.
+For multiple providers, repeat `--agent`, for example
+`sidepulse setup --agent codex --agent cursor`.
+Use `--no-agent-monitor`, `--no-sd-eject-guard`, or `--no-status-bar` to skip
+individual components.
 
 SidePulse Pro Eject Prevention keeps the built-in SD reader attached after
-macOS hibernate or lock-screen mount refusals. By default setup installs it
-system-wide when already running with system permissions, otherwise as a
-per-user LaunchAgent:
+macOS hibernate or lock-screen mount refusals. When you run `sidepulse setup`
+directly, its `auto` scope chooses a system-wide daemon if the command already
+has administrator privileges and a per-user LaunchAgent otherwise.
 
 The guard checks whether macOS restarted Disk Arbitration. If it did, the
 guard exits and launchd starts it again with a fresh disk session. KeepAlive
@@ -862,8 +894,8 @@ firmware/websim `sdled.wasm` engine, then AppKit only draws the returned RGB
 frames.
 
 Open `Settings...` from the dropdown to manage agent integrations. The settings
-window can install or uninstall Codex, Claude, Grok, and Junie hooks. The transcript
-checkboxes apply only to explicit file-based diagnostics. The status-bar app reads
+window can install or uninstall Codex, Claude, Grok, Cursor, and Junie hooks.
+The transcript checkboxes apply only to explicit file-based diagnostics. The status-bar app reads
 accounted OSC-style JSON through the daemon socket. Settings are stored at
 `${XDG_CONFIG_HOME:-~/.config}/sidepulse/agent-monitor/settings.json`.
 
@@ -873,6 +905,15 @@ connected to a JetBrains IDE; Junie hosted directly through IDE/ACP does not yet
 emit hooks. SidePulse intentionally does not register a Junie `PermissionRequest`
 hook because a successful observer hook would automatically approve the requested
 action. Junie's normal approval prompts therefore remain unchanged.
+
+Junie sessions use the project path from the hook or the Junie session index when
+available. The index at `~/.junie/sessions/index.jsonl` also supplies task names.
+In **Settings → Agents → Session
+Opening**, **Automatic** opens the recorded project in JetBrains for IDE-origin
+sessions when a matching installed IDE is available. Other Junie sessions resume
+in Terminal. You can also set either opener as the Junie preference. If SidePulse
+cannot find a matching installed IDE in JetBrains' recent projects, it falls back
+to Terminal.
 
 Settings can export the hook decision log as CSV or HTML. This log lives at
 `${XDG_STATE_HOME:-~/.local/state}/sidepulse/agent-monitor/event-status.jsonl`

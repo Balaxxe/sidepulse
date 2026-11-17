@@ -8,6 +8,7 @@ import socket
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -61,6 +62,7 @@ try:
         NSViewHeightSizable,
         NSViewWidthSizable,
         NSWorkspace,
+        NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification,
         NSWindow,
         NSWindowStyleMaskClosable,
         NSWindowStyleMaskMiniaturizable,
@@ -138,6 +140,8 @@ from .lid_sleep import (
     sleep_helper_install_command,
     sleep_helper_installed,
 )
+from .agent_terminal import AgentTerminal, claude_session_terminal, junie_session_terminal
+from .junie_index import junie_session_info
 from .models import AgentMode, AgentStatus, MODE_LABELS, provider_label
 from .providers import (
     ProviderConfig,
@@ -156,10 +160,14 @@ from .sd_eject_guard_launch import (
 )
 from .session_actions import (
     SESSION_OPEN_APP,
+    SESSION_OPEN_JETBRAINS,
     SESSION_OPEN_TERMINAL,
     SESSION_OPEN_VSCODE,
-    available_session_open_actions,
+    SessionOpenTarget,
+    available_session_open_targets,
     default_session_open_action,
+    default_session_open_target,
+    preferred_session_open_actions,
     session_open_action_label,
     session_open_target,
 )
@@ -234,6 +242,7 @@ from .settings import (
     with_imported_agent_animation_profile,
 )
 from .status_bar_launch import install_launch_agent, launch_agent_installed
+from .status_icon import NativeStatusIconRenderer
 
 
 @dataclass(frozen=True)
@@ -497,6 +506,8 @@ class StatusBarController(NSObject):
         self.event_server = None
         self.status_item = None
         self.status_icon_timer = None
+        self.status_icon_renderer = None
+        self.status_icon_native_failed = False
         self.tracking_status_menu = None
         self.timer = None
         self.device_timer = None
@@ -552,10 +563,12 @@ class StatusBarController(NSObject):
         )
         button = self.status_item.button()
         button.setTitle_("")
-        button.setImage_(image_for_symbol(STATE_IDLE.symbol, STATE_IDLE.label))
-        button.setToolTip_("SidePulse Agent Monitor: Idle")
-        button.setAccessibilityLabel_("SidePulse Agent Monitor: Idle")
         self.status_item.setVisible_(self.settings.show_menu_bar_icon)
+        self.set_status(STATE_IDLE)
+        NSWorkspace.sharedWorkspace().notificationCenter().addObserver_selector_name_object_(
+            self, "statusIconAccessibilityChanged:",
+            NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification, None,
+        )
         log_status_bar("status item created")
 
         self.refresh_(None)
@@ -779,7 +792,9 @@ class StatusBarController(NSObject):
         if not isinstance(provider, str) or not isinstance(action, str):
             return
         try:
-            self.settings = self.settings.with_provider_session_open_action(provider, action)
+            self.settings = self.settings.with_provider_session_open_action(
+                provider, None if action == "automatic" else action
+            )
             save_settings(self.settings)
         except Exception as exc:
             self.set_settings_message(f"Could not save {provider.title()} opener: {exc}")
@@ -1115,7 +1130,12 @@ class StatusBarController(NSObject):
         NSApp.terminate_(self)
 
     def applicationWillTerminate_(self, _notification):
+        NSWorkspace.sharedWorkspace().notificationCenter().removeObserver_name_object_(
+            self, NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification, None,
+        )
         self.stop_status_icon_animation()
+        if self.status_icon_renderer is not None:
+            self.status_icon_renderer.close()
         self.stop_agent_animation_preview_timer()
         self.stop_event_server()
 
@@ -1127,8 +1147,6 @@ class StatusBarController(NSObject):
         button = self.status_item.button()
         if button is None:
             return
-        button.setTitle_("")
-        button.setImage_(image_for_symbol(state.symbol, state.label))
         label = f"SidePulse Agent Monitor: {state.label}"
         if self.device_errors:
             label += " — LED output failed"
@@ -1140,12 +1158,12 @@ class StatusBarController(NSObject):
 
     def menuWillOpen_(self, menu):
         self.tracking_status_menu = menu
-        self.update_status_icon_animation()
+        self.update_status_menu_icons()
 
     def menuDidClose_(self, menu):
         if self.tracking_status_menu == menu:
             self.tracking_status_menu = None
-        self.update_status_icon_animation()
+        self.update_status_menu_icons()
 
     def stop_status_icon_animation(self) -> None:
         if self.status_icon_timer is not None:
@@ -1153,25 +1171,68 @@ class StatusBarController(NSObject):
             self.status_icon_timer = None
 
     @objc.IBAction
-    def animateStatusIcons_(self, _timer):
+    def animateStatusMenuIcons_(self, _timer):
+        self.update_status_menu_icons()
+
+    @objc.IBAction
+    def statusIconAccessibilityChanged_(self, _notification):
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "refreshStatusIconAnimation:", None, False,
+        )
+
+    @objc.IBAction
+    def refreshStatusIconAnimation_(self, _sender):
         self.update_status_icon_animation()
 
     def update_status_icon_animation(self) -> None:
-        visible = self.status_item is not None and self.status_item.isVisible()
+        if self.status_item is not None:
+            renderer = self.status_icon_renderer
+            if self.status_item.isVisible():
+                button = self.status_item.button()
+                if button is not None:
+                    if renderer is None and not self.status_icon_native_failed:
+                        renderer = NativeStatusIconRenderer(
+                            button, duration=STATUS_ICON_FRAME_SECONDS * STATUS_ICON_FRAME_COUNT,
+                        )
+                        self.status_icon_renderer = renderer
+                    self.update_status_button_icon(button, renderer)
+            elif renderer is not None:
+                renderer.hide()
+        self.update_status_menu_icons()
+
+    def update_status_button_icon(self, button, renderer) -> None:
+        state = self.current_state
+        motion = None
+        if renderer is not None and not NSWorkspace.sharedWorkspace().accessibilityDisplayShouldReduceMotion():
+            motion = {STATE_WORKING: "spin", STATE_ASK: "pulse"}.get(state)
+        static_icon = image_for_symbol(state.symbol, state.label)
+        if renderer is not None:
+            try:
+                image = animated_status_icon(state, 0) if motion else static_icon
+                renderer.update(image, motion)
+                return
+            except Exception as exc:
+                log_status_bar(f"native status icon unavailable: {exc}")
+                renderer.close()
+                self.status_icon_renderer = None
+                self.status_icon_native_failed = True
+        if button.image() != static_icon:
+            button.setImage_(static_icon)
+
+    def update_status_menu_icons(self) -> None:
         rows = []
         if self.tracking_status_menu is not None:
             for item in self.tracking_status_menu.itemArray():
                 status = item.representedObject()
                 if isinstance(status, AgentStatus) and item.action() == "openSessionPrimary:":
                     rows.append((item, status))
-        motion = not NSWorkspace.sharedWorkspace().accessibilityDisplayShouldReduceMotion()
-        animated = motion and (
-            (visible and self.current_state in (STATE_WORKING, STATE_ASK))
-            or any(state_for_mode(status.mode) in (STATE_WORKING, STATE_ASK) for _, status in rows)
+        animated = (
+            any(state_for_mode(status.mode) in (STATE_WORKING, STATE_ASK) for _, status in rows)
+            and not NSWorkspace.sharedWorkspace().accessibilityDisplayShouldReduceMotion()
         )
         if animated and self.status_icon_timer is None:
             self.status_icon_timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
-                STATUS_ICON_FRAME_SECONDS, self, "animateStatusIcons:", None, True,
+                STATUS_ICON_FRAME_SECONDS, self, "animateStatusMenuIcons:", None, True,
             )
             self.status_icon_timer.setTolerance_(0.005)
             run_loop = NSRunLoop.mainRunLoop()
@@ -1180,20 +1241,15 @@ class StatusBarController(NSObject):
         elif not animated:
             self.stop_status_icon_animation()
 
-        frame = int(time.monotonic() / STATUS_ICON_FRAME_SECONDS) % STATUS_ICON_FRAME_COUNT
-        if visible:
-            state = self.current_state
-            icon = (
-                animated_status_icon(state, frame)
-                if animated and state in (STATE_WORKING, STATE_ASK)
-                else image_for_symbol(state.symbol, state.label)
-            )
-            self.status_item.button().setImage_(icon)
         if rows:
+            frame = (
+                int(time.monotonic() / STATUS_ICON_FRAME_SECONDS) % STATUS_ICON_FRAME_COUNT
+                if animated else None
+            )
             dark_mode = is_dark_appearance(self.tracking_status_menu.effectiveAppearance())
             for item, status in rows:
                 item.setImage_(session_row_icon_for_status(
-                    status, frame if animated else None, dark_mode=dark_mode,
+                    status, frame, dark_mode=dark_mode,
                 ))
 
     def build_monitor(self):
@@ -1545,7 +1601,7 @@ class StatusBarController(NSObject):
                 and self.selected_agent_animation_profile_id
                 not in AGENT_ANIMATION_BUILT_IN_PROFILE_IDS
             )
-        for provider in ("codex", "claude", "grok"):
+        for provider in ("codex", "claude", "grok", "junie"):
             popup = self.settings_fields.get(f"{provider}_session_opener")
             if popup is not None:
                 refresh_provider_opener_popup(
@@ -2097,15 +2153,25 @@ class StatusBarController(NSObject):
         if not isinstance(status, AgentStatus):
             return
         provider = status.provider.lower()
-        requested_action = (
-            action
-            or self.settings.session_open_action(provider, status.origin)
-            or default_session_open_action(status)
+        terminal_lookup = {"junie": junie_session_terminal, "claude": claude_session_terminal}.get(provider)
+        if terminal_lookup and action in {None, SESSION_OPEN_TERMINAL}:
+            terminal = terminal_lookup(status.session_id)
+            if terminal is not None:
+                if not focus_agent_terminal(terminal, provider=provider, session_id=status.session_id):
+                    self.set_settings_message(
+                        f"{provider_label(provider)} is running, but its terminal tab could not be selected."
+                    )
+                return
+        requested_action = action or self.settings.session_open_action(
+            provider, status.origin
         )
-        target = session_open_target(status, requested_action)
+        target = (
+            session_open_target(status, requested_action) if requested_action else None
+        )
         if target is None:
-            requested_action = default_session_open_action(status)
-            target = session_open_target(status, requested_action)
+            default = default_session_open_target(status, skip_action=requested_action)
+            if default is not None:
+                requested_action, target = default
         if target is None:
             self.set_settings_message(f"No open action available for {status.display_name}.")
             return
@@ -2120,6 +2186,11 @@ class StatusBarController(NSObject):
                 custom_terminal_path=self.settings.custom_terminal_path,
                 session_hints=terminal_session_hints(status),
             )
+        elif kind == "ide":
+            if value.app_path:
+                subprocess.Popen(["open", "-a", value.app_path, value.project_path])
+            else:
+                subprocess.Popen(["open", "-b", value.bundle_id, value.project_path])
         else:
             self.set_settings_message(f"Unknown open action for {status.display_name}.")
             return
@@ -4057,13 +4128,17 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
     codex_opener = add_provider_opener_popup(
         agents_tab, "codex", value_x, 182, target, width=value_width
     )
-    add_label(agents_tab, "Claude", label_x, 150, 90, 22)
+    add_label(agents_tab, "Claude", label_x, 156, 90, 22)
     claude_opener = add_provider_opener_popup(
-        agents_tab, "claude", value_x, 148, target, width=value_width
+        agents_tab, "claude", value_x, 154, target, width=value_width
     )
-    add_label(agents_tab, "Grok", label_x, 116, 90, 22)
+    add_label(agents_tab, "Grok", label_x, 128, 90, 22)
     grok_opener = add_provider_opener_popup(
-        agents_tab, "grok", value_x, 114, target, width=value_width
+        agents_tab, "grok", value_x, 126, target, width=value_width
+    )
+    add_label(agents_tab, "Junie", label_x, 100, 90, 22)
+    junie_opener = add_provider_opener_popup(
+        agents_tab, "junie", value_x, 98, target, width=value_width
     )
 
     terminal_popup = add_terminal_popup(
@@ -4320,6 +4395,7 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         "codex_session_opener": codex_opener,
         "claude_session_opener": claude_opener,
         "grok_session_opener": grok_opener,
+        "junie_session_opener": junie_opener,
         "session_terminal": terminal_popup,
         "custom_terminal_path": custom_terminal_path,
         "recent_session_retention_hours": retention_hours,
@@ -4803,6 +4879,8 @@ def add_history_timeframe_popup(parent, x: int, y: int, target):
 
 
 def provider_open_actions(provider: str) -> tuple[str, ...]:
+    if provider == "junie":
+        return ("automatic", SESSION_OPEN_TERMINAL, SESSION_OPEN_JETBRAINS)
     if provider == "claude":
         return (SESSION_OPEN_VSCODE, SESSION_OPEN_APP, SESSION_OPEN_TERMINAL)
     if provider == "codex":
@@ -4811,18 +4889,18 @@ def provider_open_actions(provider: str) -> tuple[str, ...]:
 
 
 def default_provider_open_action(provider: str) -> str:
-    if provider == "claude":
-        return SESSION_OPEN_VSCODE
-    if provider == "codex":
-        return SESSION_OPEN_APP
-    return SESSION_OPEN_TERMINAL
+    return provider_open_actions(provider)[0]
 
 
 def provider_open_action_label(provider: str, action: str, settings=None) -> str:
+    if action == "automatic":
+        return "Automatic"
     if action == SESSION_OPEN_VSCODE:
         return "VS Code"
     if action == SESSION_OPEN_TERMINAL:
         return "Resume in Terminal"
+    if action == SESSION_OPEN_JETBRAINS:
+        return "JetBrains IDE"
     return {"codex": "Codex", "claude": "Claude"}.get(provider, "App")
 
 
@@ -5273,11 +5351,18 @@ def build_session_options_menu(
         selected = target.settings.session_open_action(status.provider, status.origin)
     else:
         selected = None
-    selected = selected or default_session_open_action(status)
-    for action in available_session_open_actions(status):
+    open_targets = available_session_open_targets(status)
+    if selected not in open_targets:
+        selected = next(
+            (action for action in preferred_session_open_actions(status) if action in open_targets),
+            None,
+        )
+    for action, open_target in open_targets.items():
         add_session_open_action_item(
             menu,
-            session_open_action_title(status, action, getattr(target, "settings", None)),
+            session_open_action_title(
+                status, action, getattr(target, "settings", None), open_target
+            ),
             status,
             action,
             target,
@@ -5312,10 +5397,12 @@ def add_session_open_action_item(
     menu.addItem_(item)
 
 
-def session_open_action_title(status: AgentStatus, action: str, settings=None) -> str:
+def session_open_action_title(
+    status: AgentStatus, action: str, settings=None, open_target: SessionOpenTarget | None = None
+) -> str:
     if action == SESSION_OPEN_TERMINAL:
         return resume_terminal_label(settings)
-    return session_open_action_label(status, action)
+    return session_open_action_label(status, action, open_target)
 
 
 def session_row_icon_for_status(
@@ -6017,13 +6104,56 @@ def terminal_app_from_custom_path(path: str) -> str:
     return TERMINAL_APP_CUSTOM
 
 
-def focus_macos_terminal_session(terms: tuple[str, ...]) -> bool:
-    condition = applescript_contains_any(("tabTitle", "tabText"), terms)
-    script = "\n".join(
-        [
-            'tell application "Terminal"',
-            "  repeat with windowRef in windows",
-            "    repeat with tabRef in tabs of windowRef",
+def focus_agent_terminal(
+    terminal: AgentTerminal, *, provider: str, session_id: str | None = None
+) -> bool:
+    if terminal.app == TERMINAL_APP_TERMINAL:
+        return focus_macos_terminal_session(tty=terminal.tty)
+    if terminal.app == TERMINAL_APP_ITERM:
+        return focus_iterm_session(tty=terminal.tty)
+    if terminal.app == TERMINAL_APP_GHOSTTY:
+        app = ghostty_application()
+        if app is None or not sb_bool(app, "isRunning"):
+            return False
+        if sb_text(app, "version").split(".")[:2] == ["1", "3"]:
+            if provider == "claude":
+                return focus_matching_ghostty_terminal(
+                    app, (), include_working_directory=False, require_unique=True,
+                    match_terminal=lambda pane: claude_ghostty_pane_matches(pane, terminal),
+                )
+            session = junie_session_info(session_id)
+            return bool(
+                session and session.task_name
+                and focus_matching_ghostty_terminal(
+                    app, (), include_working_directory=False, require_unique=True,
+                    match_terminal=lambda pane: sb_text(pane, "name") == session.task_name,
+                )
+            )
+        tty = terminal.tty.removeprefix("/dev/")
+        return focus_matching_ghostty_terminal(
+            app, (), include_working_directory=False, require_unique=True,
+            match_terminal=lambda pane: sb_text(pane, "tty").removeprefix("/dev/") == tty,
+        )
+    return False
+
+
+def claude_ghostty_pane_matches(pane, terminal: AgentTerminal) -> bool:
+    if not terminal.cwd or sb_text(pane, "workingDirectory") != terminal.cwd:
+        return False
+    name = normalize_match_text(sb_text(pane, "name"))
+    return bool(name and (
+        name == normalize_match_text(terminal.title)
+        or re.search(r"^claude(?:\s|$)|\bclaude code\b", name)
+    ))
+
+
+def focus_macos_terminal_session(terms: tuple[str, ...] = (), *, tty: str | None = None) -> bool:
+    match_lines = []
+    if tty:
+        condition = f"tty of tabRef is {applescript_quote(tty)}"
+    else:
+        condition = applescript_contains_any(("tabTitle", "tabText"), terms)
+        match_lines = [
             '      set tabTitle to ""',
             '      set tabText to ""',
             "      try",
@@ -6032,8 +6162,16 @@ def focus_macos_terminal_session(terms: tuple[str, ...]) -> bool:
             "      try",
             "        set tabText to contents of tabRef",
             "      end try",
+        ]
+    script = "\n".join(
+        [
+            'tell application "Terminal"',
+            "  repeat with windowRef in windows",
+            "    repeat with tabRef in tabs of windowRef",
+            *match_lines,
             f"      if {condition} then",
             "        set selected tab of windowRef to tabRef",
+            "        set miniaturized of windowRef to false",
             "        set index of windowRef to 1",
             "        activate",
             '        return "1"',
@@ -6047,14 +6185,13 @@ def focus_macos_terminal_session(terms: tuple[str, ...]) -> bool:
     return run_osascript_bool(script)
 
 
-def focus_iterm_session(terms: tuple[str, ...]) -> bool:
-    condition = applescript_contains_any(("sessionName", "sessionText"), terms)
-    script = "\n".join(
-        [
-            'tell application "iTerm"',
-            "  repeat with windowRef in windows",
-            "    repeat with tabRef in tabs of windowRef",
-            "      repeat with sessionRef in sessions of tabRef",
+def focus_iterm_session(terms: tuple[str, ...] = (), *, tty: str | None = None) -> bool:
+    match_lines = []
+    if tty:
+        condition = f"tty of sessionRef is {applescript_quote(tty)}"
+    else:
+        condition = applescript_contains_any(("sessionName", "sessionText"), terms)
+        match_lines = [
             '        set sessionName to ""',
             '        set sessionText to ""',
             "        try",
@@ -6063,9 +6200,18 @@ def focus_iterm_session(terms: tuple[str, ...]) -> bool:
             "        try",
             "          set sessionText to contents of sessionRef",
             "        end try",
+        ]
+    script = "\n".join(
+        [
+            'tell application "iTerm"',
+            "  repeat with windowRef in windows",
+            "    repeat with tabRef in tabs of windowRef",
+            "      repeat with sessionRef in sessions of tabRef",
+            *match_lines,
             f"        if {condition} then",
-            "          tell windowRef to select tabRef",
+            "          select tabRef",
             "          select sessionRef",
+            "          set miniaturized of windowRef to false",
             "          set index of windowRef to 1",
             "          activate",
             '          return "1"',
@@ -6128,9 +6274,10 @@ def focus_matching_ghostty_terminal(
     *,
     include_working_directory: bool,
     require_unique: bool = False,
+    match_terminal: Callable[[object], bool] | None = None,
 ) -> bool:
     normalized_terms = tuple(normalize_match_text(term) for term in terms if term)
-    if not normalized_terms:
+    if not normalized_terms and match_terminal is None:
         return False
     matches: list[tuple[object, object, object]] = []
     for window in sb_elements(sb_call(app, "windows")):
@@ -6138,10 +6285,14 @@ def focus_matching_ghostty_terminal(
         for tab in sb_elements(sb_call(window, "tabs")):
             tab_name = sb_text(tab, "name")
             for terminal in sb_elements(sb_call(tab, "terminals")):
-                values = [window_name, tab_name, sb_text(terminal, "name")]
-                if include_working_directory:
-                    values.append(sb_text(terminal, "workingDirectory"))
-                if values_match_terms(values, normalized_terms):
+                if match_terminal is not None:
+                    matched = match_terminal(terminal)
+                else:
+                    values = [window_name, tab_name, sb_text(terminal, "name")]
+                    if include_working_directory:
+                        values.append(sb_text(terminal, "workingDirectory"))
+                    matched = values_match_terms(values, normalized_terms)
+                if matched:
                     matches.append((window, tab, terminal))
     if require_unique and len(matches) != 1:
         return False

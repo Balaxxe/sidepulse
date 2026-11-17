@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -35,13 +34,8 @@ class UserInstallerTests(unittest.TestCase):
         self.assertIn('git+https://github.com/inteliwear/sidepulse.git', text)
         self.assertIn('SIDEPULSE_INSTALL_SPEC', text)
         self.assertIn("sys.version_info < (3, 10)", text)
-        self.assertIn('"$VENV/bin/sidepulse" setup', text)
-        # Recovery instructions may mention sudo; the installer must never run it.
-        executable_text = text
-        if "cat >&2 <<'EOF'" in executable_text:
-            before, rest = executable_text.split("cat >&2 <<'EOF'", 1)
-            executable_text = before + rest.split("\nEOF", 1)[1]
-        self.assertNotIn("sudo", executable_text)
+        self.assertIn('set -- setup', text)
+        self.assertIn('"$VENV/bin/sidepulse" "$@"', text)
 
     @unittest.skipUnless(os.name == "posix", "POSIX shell syntax")
     def test_curl_setup_shell_syntax(self) -> None:

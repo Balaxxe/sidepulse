@@ -3931,6 +3931,27 @@ class AgentMonitorTests(unittest.TestCase):
         configure_receiver.assert_not_called()
         link_command.assert_not_called()
 
+    def test_sidepulse_setup_installs_only_selected_agent_hooks(self) -> None:
+        args = cli_module.build_sidepulse_parser().parse_args(
+            ["setup", "--agent", "codex", "--agent", "cursor", "--agent", "codex"]
+        )
+        results = {"codex": object(), "cursor": object()}
+
+        with (
+            patch.object(cli_module, "install_codex_hooks", return_value=results["codex"]) as codex,
+            patch.object(cli_module, "install_cursor_hooks", return_value=results["cursor"]) as cursor,
+            patch.object(cli_module, "install_claude_hooks") as claude,
+            patch.object(cli_module, "install_grok_hooks") as grok,
+            patch.object(cli_module, "install_junie_hooks") as junie,
+        ):
+            self.assertEqual(cli_module.install_hook_results(args), list(results.values()))
+
+        codex.assert_called_once()
+        cursor.assert_called_once()
+        claude.assert_not_called()
+        grok.assert_not_called()
+        junie.assert_not_called()
+
     def test_sidepulse_setup_no_status_bar_still_installs_guard(self) -> None:
         parser = cli_module.build_sidepulse_parser()
         args = parser.parse_args(["setup", "--no-status-bar", "--sd-eject-guard-scope", "user"])
@@ -3973,6 +3994,28 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(result, 0)
         guard.assert_called_once_with(scope="user", dry_run=False)
         launch.assert_not_called()
+
+    def test_sidepulse_setup_can_skip_all_optional_components(self) -> None:
+        args = cli_module.build_sidepulse_parser().parse_args(
+            ["setup", "--no-agent-monitor", "--no-sd-eject-guard", "--no-status-bar"]
+        )
+        service_result = SimpleNamespace(
+            path=Path("/tmp/io.sidepulse.service.plist"), started=True, detail=""
+        )
+
+        with (
+            patch.object(cli_module.sys, "platform", "darwin"),
+            patch.object(cli_module, "install_hook_results") as hooks,
+            patch("sidepulse.service_launch.install_service", return_value=service_result) as service,
+            patch("sidepulse.sd_eject_guard_launch.install_sd_eject_guard") as guard,
+            patch("sidepulse.status_bar_launch.install_launch_agent") as status_bar,
+        ):
+            self.assertEqual(cli_module.cmd_sidepulse_setup(args), 0)
+
+        service.assert_called_once_with(start=True, dry_run=False)
+        hooks.assert_not_called()
+        guard.assert_not_called()
+        status_bar.assert_not_called()
 
     def test_sidepulse_setup_is_cli_only_on_linux(self) -> None:
         parser = cli_module.build_sidepulse_parser()
