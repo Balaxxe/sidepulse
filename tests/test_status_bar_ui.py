@@ -1655,9 +1655,11 @@ class NativeStatusIconRendererTests(StatusBarTestCase):
         self.assertFalse(self.renderer.view.glyph_layer.animationKeys())
         self.assertTrue(self.renderer.view.isHidden())
         self.assertEqual(self.button.image(), static)
+        icon_view = self.renderer.view
+        self.assertEqual(icon_view.superview(), self.button)
         self.renderer.close()
         self.assertIsNone(self.renderer.view)
-        self.assertFalse(self.button.subviews())
+        self.assertIsNone(icon_view.superview())
 
 
 
